@@ -50,7 +50,7 @@ static UV_EXE: LazyLock<Option<(PathBuf, Version)>> = LazyLock::new(|| {
                 return Some((uv_path, version));
             }
             warn!(
-                "Detected system uv version `{}` — expected a version range: `{}`.",
+                "Skip system uv version `{}` — expected a version range: `{}`.",
                 version, version_range
             );
         }
@@ -260,7 +260,7 @@ impl Uv {
         Ok(source)
     }
 
-    pub async fn install(uv_dir: &Path) -> Result<Self> {
+    pub(crate) async fn install(uv_dir: &Path) -> Result<Self> {
         // 1) Check if system `uv` meets minimum version requirement
         if let Some((uv_path, version)) = UV_EXE.as_ref() {
             trace!(
