@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
 use crate::fs::Simplified;
+use crate::version;
 
 pub const CONFIG_FILE: &str = ".pre-commit-config.yaml";
 pub const ALTER_CONFIG_FILE: &str = ".pre-commit-config.yml";
@@ -240,15 +241,39 @@ impl Stage {
     }
 }
 
-// TODO: warn unexpected keys
+fn deserialize_minimum_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+
+    let version = s
+        .parse::<semver::Version>()
+        .map_err(serde::de::Error::custom)?;
+    let cur_version = version::version()
+        .version
+        .parse::<semver::Version>()
+        .expect("Invalid prek version");
+    if version > cur_version {
+        return Err(serde::de::Error::custom(format!(
+            "Required minimum prek version `{version}` is greater than current version `{cur_version}`. Please consider updating prek.",
+        )));
+    }
+
+    Ok(Some(s))
+}
+
+// TODO: warn unexpected keys (ignoring `minimum_pre_commit_version`)
 // TODO: warn deprecated stage
 // TODO: warn sensible regex
-// TODO: check minimum_pre_commit_version
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Config {
     pub repos: Vec<Repo>,
-    /// A list of --hook-types which will be used by default when running pre-commit install.
+    /// A list of `--hook-types` which will be used by default when running `prek install`.
     /// Default is `[pre-commit]`.
     pub default_install_hook_types: Option<Vec<HookType>>,
     /// A mapping from language to the default `language_version`.
@@ -260,10 +285,12 @@ pub struct Config {
     pub files: Option<SerdeRegex>,
     /// Global file exclude pattern.
     pub exclude: Option<SerdeRegex>,
-    /// Set to true to have pre-commit stop running hooks after the first failure.
+    /// Set to true to have prek stop running hooks after the first failure.
     /// Default is false.
     pub fail_fast: Option<bool>,
-    pub minimum_pre_commit_version: Option<String>,
+    /// The minimum version of prek required to run this configuration.
+    #[serde(deserialize_with = "deserialize_minimum_version", default)]
+    pub minimum_prek_version: Option<String>,
     /// Configuration for pre-commit.ci service.
     pub ci: Option<HashMap<String, serde_yaml::Value>>,
 }
@@ -364,7 +391,9 @@ pub struct HookOptions {
     /// Print the output of the hook even if it passes.
     /// Default is false.
     pub verbose: Option<bool>,
-    pub minimum_pre_commit_version: Option<String>,
+    /// The minimum version of prek required to run this hook.
+    #[serde(deserialize_with = "deserialize_minimum_version", default)]
+    pub minimum_prek_version: Option<String>,
 }
 
 impl HookOptions {
@@ -397,7 +426,7 @@ impl HookOptions {
             require_serial,
             stages,
             verbose,
-            minimum_pre_commit_version,
+            minimum_prek_version,
         );
     }
 }
@@ -665,7 +694,7 @@ pub struct ManifestHook {
     pub name: String,
     /// The command to run. It can contain arguments that will not be overridden.
     pub entry: String,
-    /// The language of the hook. Tells pre-commit how to install and run the hook.
+    /// The language of the hook. Tells prek how to install and run the hook.
     pub language: Language,
     #[serde(flatten)]
     pub options: HookOptions,
@@ -762,7 +791,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                             ],
@@ -775,7 +804,7 @@ mod tests {
                 files: None,
                 exclude: None,
                 fail_fast: None,
-                minimum_pre_commit_version: None,
+                minimum_prek_version: None,
                 ci: None,
             },
         )
@@ -853,7 +882,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                             ],
@@ -866,7 +895,7 @@ mod tests {
                 files: None,
                 exclude: None,
                 fail_fast: None,
-                minimum_pre_commit_version: None,
+                minimum_prek_version: None,
                 ci: None,
             },
         )
@@ -962,7 +991,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                             ],
@@ -975,7 +1004,7 @@ mod tests {
                 files: None,
                 exclude: None,
                 fail_fast: None,
-                minimum_pre_commit_version: None,
+                minimum_prek_version: None,
                 ci: None,
             },
         )
@@ -1089,7 +1118,7 @@ mod tests {
                                             require_serial: None,
                                             stages: None,
                                             verbose: None,
-                                            minimum_pre_commit_version: None,
+                                            minimum_prek_version: None,
                                         },
                                     },
                                 ),
@@ -1121,7 +1150,7 @@ mod tests {
                                             require_serial: None,
                                             stages: None,
                                             verbose: None,
-                                            minimum_pre_commit_version: None,
+                                            minimum_prek_version: None,
                                         },
                                     },
                                 ),
@@ -1151,7 +1180,7 @@ mod tests {
                                             verbose: Some(
                                                 true,
                                             ),
-                                            minimum_pre_commit_version: None,
+                                            minimum_prek_version: None,
                                         },
                                     },
                                 ),
@@ -1165,7 +1194,7 @@ mod tests {
                 files: None,
                 exclude: None,
                 fail_fast: None,
-                minimum_pre_commit_version: None,
+                minimum_prek_version: None,
                 ci: None,
             },
         )
@@ -1227,7 +1256,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                                 ManifestHook {
@@ -1255,7 +1284,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                                 ManifestHook {
@@ -1283,7 +1312,7 @@ mod tests {
                                         require_serial: None,
                                         stages: None,
                                         verbose: None,
-                                        minimum_pre_commit_version: None,
+                                        minimum_prek_version: None,
                                     },
                                 },
                             ],
@@ -1296,7 +1325,7 @@ mod tests {
                 files: None,
                 exclude: None,
                 fail_fast: None,
-                minimum_pre_commit_version: None,
+                minimum_prek_version: None,
                 ci: None,
             },
         )
@@ -1315,5 +1344,67 @@ mod tests {
         let manifest = read_manifest(Path::new("tests/fixtures/uv-pre-commit-hooks.yaml"))?;
         insta::assert_debug_snapshot!(manifest);
         Ok(())
+    }
+
+    #[test]
+    fn test_minimum_prek_version() {
+        // Test that missing minimum_prek_version field doesn't cause an error
+        let yaml = indoc::indoc! {r"
+            repos:
+              - repo: local
+                hooks:
+                  - id: test-hook
+                    name: Test Hook
+                    entry: echo test
+                    language: system
+        "};
+        let result = serde_yaml::from_str::<Config>(yaml);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.minimum_prek_version.is_none());
+
+        // Test that empty minimum_prek_version field is treated as None
+        let yaml = indoc::indoc! {r"
+            repos:
+              - repo: local
+                hooks:
+                  - id: test-hook
+                    name: Test Hook
+                    entry: echo test
+                    language: system
+            minimum_prek_version: ''
+        "};
+        let result = serde_yaml::from_str::<Config>(yaml);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.minimum_prek_version.is_none());
+
+        // Test that valid minimum_prek_version field works in top-level config
+        let yaml = indoc::indoc! {r"
+            repos:
+              - repo: local
+                hooks:
+                  - id: test-hook
+                    name: Test Hook
+                    entry: echo test
+                    language: system
+            minimum_prek_version: '10.0.0'
+        "};
+        let result = serde_yaml::from_str::<Config>(yaml);
+        assert!(result.is_err());
+
+        // Test that valid minimum_prek_version field works in hook config
+        let yaml = indoc::indoc! {r"
+            repos:
+              - repo: local
+                hooks:
+                  - id: test-hook
+                    name: Test Hook
+                    entry: echo test
+                    language: system
+                    minimum_prek_version: '10.0.0'
+        "};
+        let result = serde_yaml::from_str::<Config>(yaml);
+        assert!(result.is_err());
     }
 }
