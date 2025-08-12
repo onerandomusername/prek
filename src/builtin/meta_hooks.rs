@@ -7,7 +7,7 @@ use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::cli::run::{CollectOptions, FileFilter, collect_files};
-use crate::config::{HookOptions, Language, Repo, read_config};
+use crate::config::{self, HookOptions, Language};
 use crate::hook::Hook;
 use crate::store::Store;
 use crate::workspace::Project;
@@ -30,16 +30,16 @@ pub(crate) async fn check_hooks_apply(
 
         let filter = FileFilter::new(
             &input,
-            project.config().files.as_deref(),
-            project.config().exclude.as_deref(),
-        )?;
+            project.config().files.as_ref(),
+            project.config().exclude.as_ref(),
+        );
 
         for hook in hooks {
             if hook.always_run || matches!(hook.language, Language::Fail) {
                 continue;
             }
 
-            let filenames = filter.for_hook(&hook)?;
+            let filenames = filter.for_hook(&hook);
 
             if filenames.is_empty() {
                 code = 1;
@@ -51,18 +51,17 @@ pub(crate) async fn check_hooks_apply(
     Ok((code, output))
 }
 
-// Returns true if the exclude patter matches any files matching the include pattern.
+// Returns true if the exclude pattern matches any files matching the include pattern.
 fn excludes_any<T: AsRef<str> + Sync>(
     files: &[T],
-    include: Option<&str>,
-    exclude: Option<&str>,
-) -> Result<bool> {
-    if exclude.is_none_or(|s| s == "^$") {
-        return Ok(true);
+    include: Option<&Regex>,
+    exclude: Option<&Regex>,
+) -> bool {
+    if exclude.is_none() {
+        return true;
     }
-    let include = include.map(Regex::new).transpose()?;
-    let exclude = exclude.map(Regex::new).transpose()?;
-    Ok(files.into_par_iter().any(|f| {
+
+    files.into_par_iter().any(|f| {
         let f = f.as_ref();
         if let Some(re) = &include {
             if !re.is_match(f).unwrap_or(false) {
@@ -75,7 +74,7 @@ fn excludes_any<T: AsRef<str> + Sync>(
             }
         }
         true
-    }))
+    })
 }
 
 /// Ensures that exclude directives apply to any file in the repository.
@@ -89,47 +88,45 @@ pub(crate) async fn check_useless_excludes(
     let mut output = Vec::new();
 
     for filename in filenames {
-        let config = read_config(Path::new(filename))?;
+        let config = config::read_config(Path::new(filename))?;
 
-        if !excludes_any(&input, None, config.exclude.as_deref())? {
+        if !excludes_any(&input, None, config.exclude.as_deref()) {
             code = 1;
             writeln!(
                 &mut output,
-                "The global exclude pattern {:?} does not match any files",
-                config.exclude.as_deref().unwrap_or("")
+                "The global exclude pattern `{}` does not match any files",
+                config.exclude.as_deref().map_or("", |r| r.as_str())
             )?;
         }
 
-        let filter = FileFilter::new(&input, config.files.as_deref(), config.exclude.as_deref())?;
+        let filter = FileFilter::new(&input, config.files.as_ref(), config.exclude.as_ref());
 
-        let hooks = config.repos.iter().flat_map(
-            |repo| -> Box<dyn Iterator<Item = (&String, &HookOptions)>> {
-                match repo {
-                    Repo::Remote(repo) => Box::new(repo.hooks.iter().map(|h| (&h.id, &h.options))),
-                    Repo::Local(repo) => Box::new(repo.hooks.iter().map(|h| (&h.id, &h.options))),
-                    Repo::Meta(repo) => {
-                        Box::new(repo.hooks.iter().map(|h| (&h.0.id, &h.0.options)))
-                    }
+        for repo in &config.repos {
+            let hooks_iter: Box<dyn Iterator<Item = (&String, &HookOptions)>> = match repo {
+                config::Repo::Remote(r) => Box::new(r.hooks.iter().map(|h| (&h.id, &h.options))),
+                config::Repo::Local(r) => Box::new(r.hooks.iter().map(|h| (&h.id, &h.options))),
+                config::Repo::Meta(r) => Box::new(r.hooks.iter().map(|h| (&h.0.id, &h.0.options))),
+            };
+
+            for (hook_id, opts) in hooks_iter {
+                let filtered_files = filter.by_type(
+                    opts.types.as_deref().unwrap_or(&[]),
+                    opts.types_or.as_deref().unwrap_or(&[]),
+                    opts.exclude_types.as_deref().unwrap_or(&[]),
+                );
+
+                if !excludes_any(
+                    &filtered_files,
+                    opts.files.as_deref(),
+                    opts.exclude.as_deref(),
+                ) {
+                    code = 1;
+                    writeln!(
+                        &mut output,
+                        "The exclude pattern `{}` for `{hook_id}` does not match any files",
+                        opts.exclude.as_deref().map_or("", |r| r.as_str())
+                    )?;
                 }
-            },
-        );
-        for (hook_id, opts) in hooks {
-            let filtered_files = filter.by_type(
-                opts.types.as_deref().unwrap_or(&[]),
-                opts.types_or.as_deref().unwrap_or(&[]),
-                opts.exclude_types.as_deref().unwrap_or(&[]),
-            );
-            if !excludes_any(
-                &filtered_files,
-                opts.files.as_deref(),
-                opts.exclude.as_deref(),
-            )? {
-                code = 1;
-                writeln!(
-                    &mut output,
-                    "The exclude pattern `{}` for `{hook_id}` does not match any files",
-                    opts.exclude.as_deref().unwrap_or(""),
-                )?;
             }
         }
     }
@@ -147,14 +144,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_excludes_any() -> Result<()> {
+    fn test_excludes_any() {
         let files = vec!["file1.txt", "file2.txt", "file3.txt"];
-        assert!(excludes_any(&files, Some("file.*"), Some("file2.txt"))?);
-        assert!(!excludes_any(&files, Some("file.*"), Some("file4.txt"))?);
-        assert!(excludes_any(&files, None, None)?);
+        assert!(excludes_any(
+            &files,
+            Regex::new(r"file.*").ok().as_ref(),
+            Regex::new(r"file2\.txt").ok().as_ref()
+        ));
+        assert!(!excludes_any(
+            &files,
+            Regex::new(r"file.*").ok().as_ref(),
+            Regex::new(r"file4\.txt").ok().as_ref()
+        ));
+        assert!(excludes_any(&files, None, None));
 
         let files = vec!["html/file1.html", "html/file2.html"];
-        assert!(excludes_any(&files, None, Some("^html/"))?);
-        Ok(())
+        assert!(excludes_any(
+            &files,
+            None,
+            Regex::new(r"^html/").ok().as_ref()
+        ));
     }
 }
