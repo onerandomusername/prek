@@ -1,4 +1,7 @@
+use std::process::Command;
+
 use anyhow::Result;
+use assert_cmd::assert::OutputAssertExt;
 use assert_fs::prelude::*;
 use insta::assert_snapshot;
 
@@ -135,6 +138,184 @@ fn check_json_hook() -> Result<()> {
 
     ----- stderr -----
     "#);
+
+    Ok(())
+}
+
+#[test]
+fn mixed_line_ending_hook() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+    context.configure_git_author();
+    // Disable autocrlf
+    Command::new("git")
+        .arg("config")
+        .arg("core.autocrlf")
+        .arg("false")
+        .current_dir(context.work_dir())
+        .assert()
+        .success();
+
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/pre-commit/pre-commit-hooks
+            rev: v5.0.0
+            hooks:
+              - id: mixed-line-ending
+    "});
+
+    let cwd = context.work_dir();
+
+    // Create test files
+    cwd.child("mixed.txt")
+        .write_str("line1\nline2\r\nline3\r\n")?;
+    cwd.child("only_lf.txt").write_str("line1\nline2\n")?;
+    cwd.child("only_crlf.txt").write_str("line1\r\nline2\r\n")?;
+    cwd.child("no_endings.txt").write_str("hello world")?;
+    cwd.child("empty.txt").touch()?;
+
+    context.git_add(".");
+
+    // First run: hooks should fail and fix the files
+    cmd_snapshot!(context.filters(), context.run(), @r"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    mixed line ending........................................................Failed
+    - hook id: mixed-line-ending
+    - exit code: 1
+    - files were modified by this hook
+      Fixing mixed.txt
+
+    ----- stderr -----
+    ");
+
+    // Assert that the files have been corrected
+    assert_snapshot!(context.read("mixed.txt"), @"line1\r\nline2\r\nline3\r\n");
+    assert_snapshot!(context.read("only_lf.txt"), @"line1\nline2\n");
+    assert_snapshot!(context.read("only_crlf.txt"), @"line1\r\nline2\r\n");
+
+    context.git_add(".");
+
+    // Second run: hooks should now pass.
+    cmd_snapshot!(context.filters(), context.run(), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    mixed line ending........................................................Passed
+
+    ----- stderr -----
+    "#);
+
+    // Test with --fix=no
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/pre-commit/pre-commit-hooks
+            rev: v5.0.0
+            hooks:
+              - id: mixed-line-ending
+                args: ['--fix=no']
+    "});
+    context
+        .work_dir()
+        .child("mixed.txt")
+        .write_str("line1\nline2\r\n")?;
+    context.git_add(".");
+    cmd_snapshot!(context.filters(), context.run(), @r#"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    mixed line ending........................................................Failed
+    - hook id: mixed-line-ending
+    - exit code: 1
+      mixed.txt: mixed line endings
+
+    ----- stderr -----
+    "#);
+    assert_snapshot!(context.read("mixed.txt"), @"line1\nline2\r\n");
+
+    // Test with --fix=crlf
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/pre-commit/pre-commit-hooks
+            rev: v5.0.0
+            hooks:
+              - id: mixed-line-ending
+                args: ['--fix', 'crlf']
+    "});
+    context
+        .work_dir()
+        .child("mixed.txt")
+        .write_str("line1\nline2\r\n")?;
+    context.git_add(".");
+    cmd_snapshot!(context.filters(), context.run(), @r"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    mixed line ending........................................................Failed
+    - hook id: mixed-line-ending
+    - exit code: 1
+    - files were modified by this hook
+      Fixing .pre-commit-config.yaml
+      Fixing mixed.txt
+      Fixing only_lf.txt
+
+    ----- stderr -----
+    ");
+    assert_snapshot!(context.read("mixed.txt"), @"line1\r\nline2\r\n");
+
+    // Test mixed args with --fix crlf
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/pre-commit/pre-commit-hooks
+            rev: v5.0.0
+            hooks:
+              - id: mixed-line-ending
+                args: ['--verbose', '--fix', 'crlf', '--help']
+    "});
+    context
+        .work_dir()
+        .child("mixed.txt")
+        .write_str("line1\nline2\r\nline3\n")?;
+    context.git_add(".");
+    cmd_snapshot!(context.filters(), context.run(), @r"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    mixed line ending........................................................Failed
+    - hook id: mixed-line-ending
+    - exit code: 1
+    - files were modified by this hook
+      Fixing .pre-commit-config.yaml
+      Fixing mixed.txt
+
+    ----- stderr -----
+    ");
+    assert_snapshot!(context.read("mixed.txt"), @"line1\r\nline2\r\nline3\r\n");
+
+    // Test mixed args with --fix crlf
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: https://github.com/pre-commit/pre-commit-hooks
+            rev: v5.0.0
+            hooks:
+              - id: mixed-line-ending
+                args: ['--verbose', '--fix']
+    "});
+    context
+        .work_dir()
+        .child("mixed.txt")
+        .write_str("line1\nline2\r\nline3\n")?;
+    context.git_add(".");
+    cmd_snapshot!(context.filters(), context.run(), @r"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+    mixed line ending........................................................
+    ----- stderr -----
+    error: Failed to run hook `mixed-line-ending`
+      caused by: Missing value for `--fix` argument
+    ");
 
     Ok(())
 }
