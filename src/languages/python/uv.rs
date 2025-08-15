@@ -1,29 +1,30 @@
 use std::env::consts::EXE_EXTENSION;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use axoupdater::{AxoUpdater, ReleaseSource, ReleaseSourceType, UpdateRequest};
-use futures::StreamExt;
+use anyhow::{Context, Result, bail};
+use http::header::{ACCEPT, USER_AGENT};
 use semver::Version;
-use std::process::Command;
 use target_lexicon::{Architecture, ArmArchitecture, HOST, OperatingSystem};
 use tokio::task::JoinSet;
-use tracing::{debug, enabled, trace, warn};
+use tracing::{debug, trace, warn};
 
 use constants::env_vars::EnvVars;
 
 use crate::fs::LockedFile;
+use crate::languages::download_and_extract;
 use crate::process::Cmd;
 use crate::store::{CacheBucket, Store};
-use crate::{archive, version};
+use crate::version;
 
 // The version range of `uv` we will install. Should update periodically.
 const CUR_UV_VERSION: &str = "0.8.6";
 const UV_VERSION_RANGE: &str = ">=0.7.0, <0.9.0";
 
-fn get_platform_tag() -> Result<String> {
+// Get the uv wheel platform tag for the current host.
+fn get_wheel_platform_tag() -> Result<String> {
     let platform_tag = match (HOST.operating_system, HOST.architecture) {
         // Linux platforms
         // TODO: support musllinux?
@@ -94,8 +95,7 @@ static UV_EXE: LazyLock<Option<(PathBuf, Version)>> = LazyLock::new(|| {
                 return Some((uv_path, version));
             }
             warn!(
-                "Skip system uv version `{}` — expected a version range: `{}`.",
-                version, version_range
+                "Skip system uv version `{version}` — expected a version range: `{version_range}`."
             );
         }
     }
@@ -151,45 +151,36 @@ impl InstallSource {
     }
 
     async fn install_from_github(&self, target: &Path) -> Result<()> {
-        let mut installer = AxoUpdater::new_for("uv");
-        installer
-            .configure_version_specifier(UpdateRequest::SpecificTag(CUR_UV_VERSION.to_string()));
-        installer.always_update(true);
-        installer.set_install_dir(&target.to_string_lossy());
-        installer.set_release_source(ReleaseSource {
-            release_type: ReleaseSourceType::GitHub,
-            owner: "astral-sh".to_string(),
-            name: "uv".to_string(),
-            app_name: "uv".to_string(),
-        });
-        if enabled!(tracing::Level::DEBUG) {
-            installer.enable_installer_output();
-            unsafe { std::env::set_var("INSTALLER_PRINT_VERBOSE", "1") };
-        } else {
-            installer.disable_installer_output();
-        }
-        // We don't want the installer to modify the PATH, and don't need the receipt.
-        unsafe { std::env::set_var("UV_UNMANAGED_INSTALL", "1") };
+        let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
+        let archive_name = format!("uv-{HOST}.{ext}");
+        let download_url = format!(
+            "https://github.com/astral-sh/uv/releases/download/{CUR_UV_VERSION}/{archive_name}"
+        );
 
-        match installer.run().await {
-            Ok(Some(result)) => {
-                debug!(
-                    uv = %target.display(),
-                    version = result.new_version_tag,
-                    "Successfully installed uv"
-                );
-                Ok(())
+        let client = reqwest::Client::new();
+        download_and_extract(&client, &download_url, &archive_name, async |extracted| {
+            let source = extracted.join("uv").with_extension(EXE_EXTENSION);
+            let target_path = target.join("uv").with_extension(EXE_EXTENSION);
+
+            if target_path.exists() {
+                debug!(target = %target.display(), "Removing existing uv");
+                fs_err::tokio::remove_dir_all(&target).await?;
             }
-            Ok(None) => Ok(()),
-            Err(err) => {
-                warn!(?err, "Failed to install uv");
-                Err(err.into())
-            }
-        }
+
+            debug!(?source, target = %target_path.display(), "Moving uv to target");
+            // TODO: retry on Windows
+            fs_err::tokio::rename(source, target_path).await?;
+
+            anyhow::Ok(())
+        })
+        .await
+        .context("Failed to download and extra uv")?;
+
+        Ok(())
     }
 
     async fn install_from_pypi(&self, target: &Path, source: &PyPiMirror) -> Result<()> {
-        let platform_tag = get_platform_tag()?;
+        let platform_tag = get_wheel_platform_tag()?;
         let wheel_name = format!("uv-{CUR_UV_VERSION}-py3-none-{platform_tag}.whl");
 
         // Use PyPI JSON API instead of parsing HTML
@@ -203,7 +194,7 @@ impl InstallSource {
         debug!("Fetching uv metadata from: {}", api_url);
         let response = client
             .get(&api_url)
-            .header("User-Agent", format!("prek/{}", version::version().version))
+            .header(USER_AGENT, format!("prek/{}", version::version()))
             .header("Accept", "*/*")
             .send()
             .await?;
@@ -235,15 +226,13 @@ impl InstallSource {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing download URL in PyPI response"))?;
 
-        debug!("Downloading uv wheel: {download_url}");
-
-        // Download and extract the wheel
-        self.download_and_extract_wheel(target, download_url).await
+        self.download_and_extract_wheel(&client, target, &wheel_name, download_url)
+            .await
     }
 
     async fn install_from_simple_api(&self, target: &Path, source: &PyPiMirror) -> Result<()> {
         // Fallback for mirrors that don't support JSON API
-        let platform_tag = get_platform_tag()?;
+        let platform_tag = get_wheel_platform_tag()?;
         let wheel_name = format!("uv-{CUR_UV_VERSION}-py3-none-{platform_tag}.whl");
 
         let simple_url = format!("{}uv/", source.url());
@@ -252,8 +241,8 @@ impl InstallSource {
         debug!("Fetching from simple API: {}", simple_url);
         let response = client
             .get(&simple_url)
-            .header("User-Agent", format!("prek/{}", version::version().version))
-            .header("Accept", "*/*")
+            .header(USER_AGENT, format!("prek/{}", version::version().version))
+            .header(ACCEPT, "*/*")
             .send()
             .await?;
         let html = response.text().await?;
@@ -287,61 +276,51 @@ impl InstallSource {
             format!("{simple_url}{download_path}")
         };
 
-        debug!("Downloading uv wheel: {download_url}");
-        self.download_and_extract_wheel(target, &download_url).await
+        self.download_and_extract_wheel(&client, target, &wheel_name, &download_url)
+            .await
     }
 
-    async fn download_and_extract_wheel(&self, target: &Path, download_url: &str) -> Result<()> {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(download_url)
-            .header("User-Agent", format!("prek/{}", version::version().version))
-            .header("Accept", "*/*")
-            .send()
-            .await?;
+    async fn download_and_extract_wheel(
+        &self,
+        client: &reqwest::Client,
+        target: &Path,
+        filename: &str,
+        download_url: &str,
+    ) -> Result<()> {
+        download_and_extract(client, download_url, filename, async |extracted| {
+            // Find the uv binary in the extracted contents
+            let data_dir = format!("uv-{CUR_UV_VERSION}.data");
+            let extracted_uv = extracted
+                .join(data_dir)
+                .join("scripts")
+                .join("uv")
+                .with_extension(EXE_EXTENSION);
 
-        if !response.status().is_success() {
-            bail!("Failed to download wheel: {}", response.status());
-        }
+            // Copy the binary to the target location
+            let target_path = target.join("uv").with_extension(EXE_EXTENSION);
+            if target_path.exists() {
+                debug!(target = %target.display(), "Removing existing uv");
+                fs_err::tokio::remove_dir_all(&target).await?;
+            }
 
-        debug!("Downloaded wheel, extracting...");
+            debug!(?extracted_uv, target = %target_path.display(), "Moving uv to target");
+            fs_err::tokio::rename(&extracted_uv, &target_path).await?;
 
-        // Create a temporary directory to extract the wheel
-        let temp_dir = tempfile::tempdir()?;
-        let temp_extract_dir = temp_dir.path();
+            // Set executable permissions on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let metadata = fs_err::tokio::metadata(&target_path).await?;
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                fs_err::tokio::set_permissions(&target_path, perms).await?;
+            }
 
-        // Extract the wheel using the existing archive functionality
-        let stream = response.bytes_stream();
-        let reader = tokio_util::io::StreamReader::new(
-            stream.map(|result| result.map_err(std::io::Error::other)),
-        );
+            Ok(())
+        })
+        .await
+        .context("Failed to download and extract uv wheel")?;
 
-        // TODO: check sha256 checksum
-        archive::unzip(reader, temp_extract_dir).await?;
-
-        // Find the uv binary in the extracted contents
-        let data_dir = format!("uv-{CUR_UV_VERSION}.data");
-        let extracted_uv = temp_extract_dir
-            .join(data_dir)
-            .join("scripts")
-            .join("uv")
-            .with_extension(EXE_EXTENSION);
-
-        // Copy the binary to the target location
-        let target_path = target.join("uv").with_extension(EXE_EXTENSION);
-        fs_err::tokio::copy(&extracted_uv, &target_path).await?;
-
-        // Set executable permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = fs_err::tokio::metadata(&target_path).await?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o755);
-            fs_err::tokio::set_permissions(&target_path, perms).await?;
-        }
-
-        debug!("Extracted uv binary to: {}", target_path.display());
         Ok(())
     }
 
@@ -365,14 +344,8 @@ impl InstallSource {
         let uv = target
             .join(&bin_dir)
             .join("uv")
-            .with_extension(std::env::consts::EXE_EXTENSION);
-        fs_err::tokio::rename(
-            &uv,
-            target
-                .join("uv")
-                .with_extension(std::env::consts::EXE_EXTENSION),
-        )
-        .await?;
+            .with_extension(EXE_EXTENSION);
+        fs_err::tokio::rename(&uv, target.join("uv").with_extension(EXE_EXTENSION)).await?;
         fs_err::tokio::remove_dir_all(bin_dir).await?;
         fs_err::tokio::remove_dir_all(lib_dir).await?;
 
@@ -443,13 +416,19 @@ impl Uv {
             Ok(best)
         }
 
-        let client = reqwest::Client::new();
-        let source = tokio::select! {
-            Ok(true) = check_github(&client) => InstallSource::GitHub,
-            Ok(source) = select_best_pypi(&client) => InstallSource::PyPi(source),
-            else => {
-                warn!("Failed to check uv source availability, falling back to pip install");
-                InstallSource::Pip
+        let source = if cfg!(feature = "uv-source-github") {
+            InstallSource::GitHub
+        } else if cfg!(feature = "uv-source-pypi") {
+            InstallSource::PyPi(PyPiMirror::Pypi)
+        } else {
+            let client = reqwest::Client::new();
+            tokio::select! {
+                Ok(true) = check_github(&client) => InstallSource::GitHub,
+                Ok(source) = select_best_pypi(&client) => InstallSource::PyPi(source),
+                else => {
+                    warn!("Failed to check uv source availability, falling back to pip install");
+                    InstallSource::Pip
+                }
             }
         };
 
@@ -469,9 +448,7 @@ impl Uv {
         }
 
         // 2) Use or install managed `uv`
-        let uv_path = uv_dir
-            .join("uv")
-            .with_extension(std::env::consts::EXE_EXTENSION);
+        let uv_path = uv_dir.join("uv").with_extension(EXE_EXTENSION);
 
         if uv_path.is_file() {
             trace!(uv = %uv_path.display(), "Found managed uv");
