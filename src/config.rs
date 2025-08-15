@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::fs::Simplified;
 use crate::version;
+use crate::warn_user;
 
 pub const CONFIG_FILE: &str = ".pre-commit-config.yaml";
 pub const ALTER_CONFIG_FILE: &str = ".pre-commit-config.yml";
@@ -268,7 +269,6 @@ where
     Ok(Some(s))
 }
 
-// TODO: warn unexpected keys (ignoring `minimum_pre_commit_version`)
 // TODO: warn deprecated stage
 // TODO: warn sensible regex
 #[derive(Debug, Clone, Deserialize)]
@@ -650,6 +650,7 @@ impl<'de> Deserialize<'de> for Repo {
         match repo {
             RepoLocation::Remote(url) => {
                 #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
                 struct _RemoteRepo {
                     rev: String,
                     hooks: Vec<RemoteHook>,
@@ -733,8 +734,31 @@ pub fn read_config(path: &Path) -> Result<Config, Error> {
         }
         Err(e) => return Err(e.into()),
     };
-    let config = serde_yaml::from_str(&content)
-        .map_err(|e| Error::Yaml(path.user_display().to_string(), e))?;
+
+    let expected_unused = ["minimum_pre_commit_version"];
+
+    let deserializer = serde_yaml::Deserializer::from_str(&content);
+    let mut unused = Vec::new();
+    let config: Config = serde_ignored::deserialize(deserializer, |path| {
+        let key = path.to_string();
+        if !expected_unused.contains(&key.as_str()) {
+            unused.push(key);
+        }
+    })
+    .map_err(|e| Error::Yaml(path.user_display().to_string(), e))?;
+
+    if !unused.is_empty() {
+        warn_user!(
+            "Ignored unexpected keys in `{}`: {}",
+            path.display().cyan(),
+            unused
+                .into_iter()
+                .map(|key| format!("`{}`", key.yellow()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     Ok(config)
 }
 
