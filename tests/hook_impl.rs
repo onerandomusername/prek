@@ -10,9 +10,7 @@ mod common;
 #[test]
 fn hook_impl() {
     let context = TestContext::new();
-
     context.init_project();
-
     context.write_pre_commit_config(indoc! { r"
         repos:
         - repo: local
@@ -26,6 +24,7 @@ fn hook_impl() {
 
     context.git_add(".");
     context.configure_git_author();
+
     let mut commit = Command::new("git");
     commit
         .arg("commit")
@@ -37,7 +36,7 @@ fn hook_impl() {
     success: true
     exit_code: 0
     ----- stdout -----
-    prek installed at .git/hooks/pre-commit
+    prek installed at `.git/hooks/pre-commit`
 
     ----- stderr -----
     "#);
