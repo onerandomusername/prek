@@ -1,8 +1,9 @@
 # prek
 
-![Development Status](https://img.shields.io/badge/Development-Early_Stage-yellowgreen)
 [![CI](https://github.com/j178/prek/actions/workflows/ci.yml/badge.svg)](https://github.com/j178/prek/actions/workflows/ci.yml)
 [![GitHub downloads](https://img.shields.io/github/downloads/j178/prek/total?&logo=github)](https://github.com/j178/prek/releases)
+[![PyPI Downloads](https://static.pepy.tech/badge/prek)](https://pepy.tech/projects/prek)
+![Homebrew Formula Downloads](https://img.shields.io/homebrew/installs/dm/prek)
 [![Discord](https://img.shields.io/discord/1403581202102878289?logo=discord)](https://discord.gg/3NRJUqJz86)
 
 <img width="250" alt="prek" src="https://github.com/user-attachments/assets/3a87815a-9f3c-48e7-8c1d-384b07ad3b35" />
@@ -18,8 +19,7 @@ while also providing some additional long-requested features.
 > This project was previously named `prefligit`, but it has been renamed to `prek` to avoid typosquatting issues.
 
 > [!WARNING]
-> This project is still in early stage of development, some features are still not implemented.
-> It is not production-ready yet, but feel free to try it out and provide feedback.
+> It is not production-ready yet, some subcommands and languages are still not implemented, but feel free to try it out and provide feedback.
 >
 > Current supported languages are `python`, `node`, `go`, `docker`, `docker-image`, `pygrep`, `system`, `script` and `fail`.
 
