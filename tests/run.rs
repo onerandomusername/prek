@@ -1585,3 +1585,71 @@ fn shebang_script() -> Result<()> {
 
     Ok(())
 }
+
+/// Test `git commit -a` works without `.git/index.lock exists` error.
+#[test]
+fn git_commit_a() -> Result<()> {
+    let context = TestContext::new();
+    context.init_project();
+    context.configure_git_author();
+    context.disable_auto_crlf();
+
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: local
+            hooks:
+              - id: echo
+                name: echo
+                language: system
+                entry: echo hello
+                pass_filenames: false
+                always_run: true
+    "});
+
+    // Create a file and commit it.
+    let cwd = context.work_dir();
+    let file = cwd.child("file.txt");
+    file.write_str("Hello, world!\n")?;
+
+    cmd_snapshot!(context.filters(), context.install(), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    prek installed at .git/hooks/pre-commit
+
+    ----- stderr -----
+    "#);
+
+    context.git_add(".");
+    context.git_commit("Initial commit");
+
+    // Edit the file
+    file.write_str("Hello, world again!\n")?;
+
+    let mut commit = Command::new("git");
+    commit
+        .arg("commit")
+        .arg("-a")
+        .arg("-m")
+        .arg("Update file")
+        .current_dir(cwd);
+
+    let filters = context
+        .filters()
+        .into_iter()
+        .chain([(r"\[master \w{7}\]", r"[master COMMIT]")])
+        .collect::<Vec<_>>();
+
+    cmd_snapshot!(filters, commit, @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    [master COMMIT] Update file
+     1 file changed, 1 insertion(+), 1 deletion(-)
+
+    ----- stderr -----
+    echo.....................................................................Passed
+    "#);
+
+    Ok(())
+}
