@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{self, CONFIG_FILE, HookType, Stage};
 use crate::workspace::Project;
 
+mod auto_update;
 mod clean;
 mod hook_impl;
 mod install;
@@ -25,6 +26,7 @@ mod self_update;
 mod validate;
 
 use crate::git::GIT_ROOT;
+pub(crate) use auto_update::auto_update;
 pub(crate) use clean::clean;
 pub(crate) use hook_impl::hook_impl;
 pub(crate) use install::{init_template_dir, install, install_hooks, uninstall};
@@ -413,13 +415,17 @@ pub(crate) struct SampleConfigArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct AutoUpdateArgs {
-    #[arg(long, default_value_t = true)]
+    /// Update to the bleeding edge of the default branch instead of the latest tagged version.
+    #[arg(long)]
     pub(crate) bleeding_edge: bool,
+    /// Store "frozen" hashes in `rev` instead of tag names.
     #[arg(long)]
     pub(crate) freeze: bool,
+    /// Only update this repository. This option may be specified multiple times.
     #[arg(long)]
-    pub(crate) repo: Option<String>,
-    #[arg(short, long, default_value_t = 1)]
+    pub(crate) repo: Vec<String>,
+    /// Number of threads to use.
+    #[arg(short, long, default_value_t = 3)]
     pub(crate) jobs: usize,
 }
 
