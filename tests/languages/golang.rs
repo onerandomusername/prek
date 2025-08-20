@@ -167,7 +167,7 @@ fn remote_hook() {
     context.write_pre_commit_config(indoc::indoc! {r"
         repos:
           - repo: https://github.com/prek-test-repos/golang-hooks
-            rev: main
+            rev: v1.0
             hooks:
               - id: echo
                 verbose: true
@@ -175,7 +175,7 @@ fn remote_hook() {
         "});
     context.git_add(".");
 
-    cmd_snapshot!(context.filters(), context.run(), @r#"
+    cmd_snapshot!(context.filters(), context.run(), @r"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -185,13 +185,13 @@ fn remote_hook() {
       .pre-commit-config.yaml
 
     ----- stderr -----
-    "#);
+    ");
 
     // Run hooks with system found go.
     context.write_pre_commit_config(indoc::indoc! {r"
         repos:
           - repo: https://github.com/prek-test-repos/golang-hooks
-            rev: main
+            rev: v1.0
             hooks:
               - id: echo
                 verbose: true
@@ -199,7 +199,7 @@ fn remote_hook() {
         "});
     context.git_add(".");
 
-    cmd_snapshot!(context.filters(), context.run(), @r#"
+    cmd_snapshot!(context.filters(), context.run(), @r"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -209,5 +209,5 @@ fn remote_hook() {
       .pre-commit-config.yaml
 
     ----- stderr -----
-    "#);
+    ");
 }
