@@ -1,4 +1,14 @@
+[settings]
+cargo.binstall = true
+
 [tools]
+# For snapshot testing
+cargo-insta = "latest"
+# For running tests in parallel
+"cargo:cargo-nextest" = "latest"
+# For pre-commit hooks
+prek = "latest"
+
 # Toolchains used in the integration tests.
 python = [ "3.12.11"]
 node = [ "19.9.0" ]
