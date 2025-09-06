@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 use std::fmt::Display;
-use std::hash::Hash;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -10,6 +11,7 @@ use ignore::WalkState;
 use itertools::zip_eq;
 use owo_colors::OwoColorize;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, instrument};
 
@@ -18,7 +20,7 @@ use crate::config::{self, CONFIG_FILE, Config, ManifestHook, read_config};
 use crate::fs::Simplified;
 use crate::git::GIT_ROOT;
 use crate::hook::{self, Hook, HookBuilder, Repo};
-use crate::store::Store;
+use crate::store::{CacheBucket, STORE, Store};
 use crate::workspace::Error::MissingPreCommitConfig;
 use crate::{git, store};
 
@@ -65,14 +67,13 @@ pub(crate) struct Project {
     relative_path: PathBuf,
     // The order index of the project in the workspace.
     idx: usize,
-    depth: usize,
     config: Config,
     repos: Vec<Arc<Repo>>,
 }
 
 impl Display for Project {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.depth == 1 {
+        if self.relative_path.as_os_str().is_empty() {
             write!(f, ".")
         } else {
             write!(f, "{}", self.relative_path.display())
@@ -121,7 +122,6 @@ impl Project {
             config,
             config_path: config_path.into_owned(),
             idx: 0,
-            depth: 0,
             relative_path: PathBuf::new(),
             repos: Vec::with_capacity(size),
         })
@@ -143,25 +143,14 @@ impl Project {
             )?);
         }
 
-        // TODO: add back `.pre-commit-config.yml` support
-        // Walk from the given path up to the git root, to find the project root.
-        let workspace_root = dir
-            .ancestors()
-            .take_while(|p| git_root.parent().map(|root| *p != root).unwrap_or(true))
-            .find(|p| p.join(CONFIG_FILE).is_file())
-            .ok_or(MissingPreCommitConfig)?
-            .to_path_buf();
-
+        let workspace_root = Workspace::find_root(None, dir)?;
         debug!("Found project root at {}", workspace_root.user_display());
+
         Ok(Project::from_directory(&workspace_root)?)
     }
 
     fn with_relative_path(&mut self, relative_path: PathBuf) {
         self.relative_path = relative_path;
-    }
-
-    fn with_depth(&mut self, depth: usize) {
-        self.depth = depth;
     }
 
     fn with_idx(&mut self, idx: usize) {
@@ -192,7 +181,7 @@ impl Project {
     }
 
     pub(crate) fn depth(&self) -> usize {
-        self.depth
+        self.relative_path.components().count()
     }
 
     pub(crate) fn idx(&self) -> usize {
@@ -343,6 +332,175 @@ impl Project {
     }
 }
 
+/// Cache entry for a project configuration file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedConfigFile {
+    /// Absolute path to the config file
+    path: PathBuf,
+    /// Last modification time
+    modified: SystemTime,
+    /// File size for quick change detection
+    size: u64,
+}
+
+/// Workspace discovery cache
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceCache {
+    /// Cache version for compatibility
+    version: u32,
+    /// Workspace root path
+    workspace_root: PathBuf,
+    /// Cache creation timestamp
+    created_at: SystemTime,
+    /// Configuration files with their metadata
+    config_files: Vec<CachedConfigFile>,
+}
+
+impl WorkspaceCache {
+    const CURRENT_VERSION: u32 = 1;
+    /// Maximum cache age before forcing rediscovery (1 hour)
+    const MAX_CACHE_AGE: u64 = 60 * 60;
+
+    /// Create a new cache from workspace discovery results
+    fn new(workspace_root: PathBuf, projects: &[Arc<Project>]) -> Self {
+        let mut config_files = Vec::new();
+
+        for project in projects {
+            if let Ok(metadata) = std::fs::metadata(&project.config_path) {
+                config_files.push(CachedConfigFile {
+                    path: project.config_path.clone(),
+                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    size: metadata.len(),
+                });
+            }
+        }
+
+        Self {
+            version: Self::CURRENT_VERSION,
+            created_at: SystemTime::now(),
+            workspace_root,
+            config_files,
+        }
+    }
+
+    /// Check if the cache is still valid
+    fn is_valid(&self) -> bool {
+        // Check cache age - invalidate if older than MAX_CACHE_AGE
+        if let Ok(elapsed) = self.created_at.elapsed() {
+            if elapsed.as_secs() > Self::MAX_CACHE_AGE {
+                debug!(
+                    "Cache is too old ({}s > {}s), invalidating",
+                    elapsed.as_secs(),
+                    Self::MAX_CACHE_AGE
+                );
+                return false;
+            }
+        }
+
+        // Check if all config files still exist and haven't been modified
+        for cached_file in &self.config_files {
+            if let Ok(metadata) = std::fs::metadata(&cached_file.path) {
+                let current_modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let current_size = metadata.len();
+
+                if current_modified != cached_file.modified || current_size != cached_file.size {
+                    debug!(
+                        path = %cached_file.path.display(),
+                        "Config file changed, invalidating cache"
+                    );
+                    return false;
+                }
+            } else {
+                debug!(
+                    path = %cached_file.path.display(),
+                    "Config file no longer exists, invalidating cache"
+                );
+                return false;
+            }
+        }
+
+        // Check if workspace root still exists
+        if !self.workspace_root.exists() {
+            debug!("Workspace root no longer exists, invalidating cache");
+            return false;
+        }
+
+        // Note: We don't check for newly added config files here to avoid
+        // expensive directory traversal. New files will be detected when
+        // the cache fails to load a project during cache restoration,
+        // or when the cache expires due to age (every hour).
+
+        true
+    }
+
+    /// Get cache file path for a workspace
+    fn cache_path(workspace_root: &Path) -> Option<PathBuf> {
+        let mut hasher = DefaultHasher::new();
+        workspace_root.hash(&mut hasher);
+        let digest = hex::encode(hasher.finish().to_le_bytes());
+        STORE
+            .as_ref()
+            .map(|store| {
+                store
+                    .cache_path(CacheBucket::Prek)
+                    .join("workspace")
+                    .join(digest)
+            })
+            .ok()
+    }
+
+    /// Load cache from file
+    fn load(workspace_root: &Path, refresh: bool) -> Option<Self> {
+        if refresh {
+            return None;
+        }
+        let cache_path = Self::cache_path(workspace_root)?;
+
+        if !cache_path.exists() {
+            return None;
+        }
+
+        match std::fs::read_to_string(&cache_path) {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(cache) => {
+                    if cache.version == Self::CURRENT_VERSION && cache.is_valid() {
+                        Some(cache)
+                    } else {
+                        // Invalid cache, remove it
+                        let _ = std::fs::remove_file(&cache_path);
+                        None
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to deserialize cache: {}", e);
+                    let _ = std::fs::remove_file(&cache_path);
+                    None
+                }
+            },
+            Err(e) => {
+                debug!("Failed to read cache file: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Save cache to file
+    fn save(&self) -> Result<()> {
+        let Some(cache_path) = Self::cache_path(&self.workspace_root) else {
+            return Ok(());
+        };
+
+        // Create cache directory if it doesn't exist
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(&cache_path, content)?;
+        Ok(())
+    }
+}
+
 pub(crate) struct Workspace {
     root: PathBuf,
     projects: Vec<Arc<Project>>,
@@ -378,6 +536,7 @@ impl Workspace {
         root: PathBuf,
         config: Option<PathBuf>,
         selectors: Option<&Selectors>,
+        refresh: bool,
     ) -> Result<Self, Error> {
         if let Some(config) = config {
             let project = Project::from_config_file(config.into(), Some(root.clone()))?;
@@ -387,10 +546,72 @@ impl Workspace {
             });
         }
 
-        // Walk subdirectories to find all projects.
+        // Try to load from cache first
+        let projects = if let Some(cache) = WorkspaceCache::load(&root, refresh) {
+            debug!("Loaded workspace from cache");
+            let projects: Result<Vec<_>, _> = cache
+                .config_files
+                .into_iter()
+                .map(
+                    |config_file| match Project::from_config_file(config_file.path.into(), None) {
+                        Ok(mut project) => {
+                            let relative_path = project
+                                .config_file()
+                                .parent()
+                                .and_then(|p| p.strip_prefix(&root).ok())
+                                .expect("Entry path should be relative to the root")
+                                .to_path_buf();
+                            project.with_relative_path(relative_path);
+                            Ok(Arc::new(project))
+                        }
+                        Err(e) => {
+                            debug!("Failed to load cached project config: {}", e);
+                            Err(e)
+                        }
+                    },
+                )
+                .collect();
+
+            match projects {
+                Ok(projects) if !projects.is_empty() => Some(projects),
+                _ => {
+                    debug!("Cache invalid or empty, performing fresh discovery");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut projects = if let Some(projects) = projects {
+            projects
+        } else {
+            // Cache miss or invalid, perform fresh discovery
+            debug!("Performing fresh workspace discovery");
+            let projects = Self::discover_fresh(&root)?;
+
+            // Save to cache
+            let cache = WorkspaceCache::new(root.clone(), &projects);
+            if let Err(e) = cache.save() {
+                debug!("Failed to save workspace cache: {}", e);
+            }
+            projects
+        };
+
+        if let Some(selectors) = selectors {
+            projects.retain(|p| selectors.matches_path(p.relative_path()));
+        }
+        let mut workspace = Self { root, projects };
+        workspace.sort_and_index_projects();
+
+        Ok(workspace)
+    }
+
+    /// Perform fresh workspace discovery without cache
+    fn discover_fresh(root: &Path) -> Result<Vec<Arc<Project>>, Error> {
         let projects = Mutex::new(Ok(Vec::new()));
 
-        ignore::WalkBuilder::new(&root)
+        ignore::WalkBuilder::new(root)
             .follow_links(false)
             .hidden(false) // Find from hidden directories.
             .build_parallel()
@@ -403,36 +624,16 @@ impl Workspace {
                         return WalkState::Continue;
                     };
 
-                    // If it's a directory, check if it matches the selectors.
-                    // Do not skip the root directory even if it doesn't match.
-                    if file_type.is_dir() && entry.depth() > 0 {
-                        let Some(selectors) = selectors.as_ref() else {
-                            return WalkState::Continue;
-                        };
-                        let relative_path = entry
-                            .path()
-                            .strip_prefix(&root)
-                            .expect("Entry path should be relative to the root");
-
-                        if !selectors.matches_path(relative_path) {
-                            debug!(
-                                path = %relative_path.display(),
-                                "Skipping unselected path"
-                            );
-                            return WalkState::Skip;
-                        }
-                    } else if file_type.is_file() && entry.file_name() == CONFIG_FILE {
+                    if file_type.is_file() && entry.file_name() == CONFIG_FILE {
                         match Project::from_config_file(entry.path().into(), None) {
                             Ok(mut project) => {
-                                let depth = entry.depth();
                                 let relative_path = entry
                                     .into_path()
                                     .parent()
-                                    .and_then(|p| p.strip_prefix(&root).ok())
+                                    .and_then(|p| p.strip_prefix(root).ok())
                                     .expect("Entry path should be relative to the root")
                                     .to_path_buf();
                                 project.with_relative_path(relative_path);
-                                project.with_depth(depth);
 
                                 projects
                                     .lock()
@@ -453,13 +654,18 @@ impl Workspace {
                 })
             });
 
-        let mut projects = projects.into_inner().unwrap()?;
+        let projects = projects.into_inner().unwrap()?;
         debug_assert!(!projects.is_empty(), "At least one project should be found");
 
+        Ok(projects)
+    }
+
+    /// Sort projects by depth and assign indices
+    fn sort_and_index_projects(&mut self) {
         // Sort projects by their depth in the directory tree.
         // The deeper the project comes first.
         // This is useful for nested projects where we want to prefer the most specific project.
-        projects.sort_by(|a, b| {
+        self.projects.sort_by(|a, b| {
             b.depth()
                 .cmp(&a.depth())
                 // If depth is the same, sort by relative path to have a deterministic order.
@@ -467,11 +673,9 @@ impl Workspace {
         });
 
         // Assign index to each project.
-        for (idx, project) in projects.iter_mut().enumerate() {
+        for (idx, project) in self.projects.iter_mut().enumerate() {
             Arc::get_mut(project).unwrap().with_idx(idx);
         }
-
-        Ok(Self { root, projects })
     }
 
     pub(crate) fn root(&self) -> &Path {
