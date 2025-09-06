@@ -1705,6 +1705,7 @@ fn completion() {
     --last-commit	Run hooks against the last commit. Equivalent to `--from-ref HEAD~1 --to-ref HEAD`
     --hook-stage	The stage during which the hook is fired
     --show-diff-on-failure	When hooks fail, run `git diff` directly afterward
+    --dry-run	Do not run the hooks, but print the hooks that would have been run
     --config	Path to alternate config file
     --cd	Change to directory before running
     --color	Whether to use color in output
@@ -1792,4 +1793,34 @@ fn reuse_env() -> Result<()> {
     assert_eq!(context.home_dir().child("hooks").read_dir()?.count(), 2);
 
     Ok(())
+}
+
+#[test]
+fn dry_run() {
+    let context = TestContext::new();
+    context.init_project();
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: local
+            hooks:
+              - id: fail
+                name: fail
+                entry: fail
+                language: fail
+    "});
+    context.git_add(".");
+
+    // Run with `--dry-run`
+    cmd_snapshot!(context.filters(), context.run().arg("--dry-run").arg("-v"), @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    fail.....................................................................Dry Run
+    - hook id: fail
+    - duration: [TIME]
+      `fail` would be run on 1 files:
+      - .pre-commit-config.yaml
+
+    ----- stderr -----
+    ");
 }

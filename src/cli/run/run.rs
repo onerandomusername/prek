@@ -44,6 +44,7 @@ pub(crate) async fn run(
     directories: Vec<String>,
     last_commit: bool,
     show_diff_on_failure: bool,
+    dry_run: bool,
     extra_args: RunExtraArgs,
     verbose: bool,
     printer: Printer,
@@ -164,6 +165,7 @@ pub(crate) async fn run(
         filenames,
         store,
         show_diff_on_failure,
+        dry_run,
         verbose,
         printer,
     )
@@ -381,6 +383,7 @@ impl StatusPrinter {
     const PASSED: &'static str = "Passed";
     const FAILED: &'static str = "Failed";
     const SKIPPED: &'static str = "Skipped";
+    const DRY_RUN: &'static str = "Dry Run";
     const NO_FILES: &'static str = "(no files to check)";
     const UNIMPLEMENTED: &'static str = "(unimplemented yet)";
 
@@ -426,6 +429,10 @@ impl StatusPrinter {
         )
     }
 
+    fn write_dry_run(&self) -> Result<(), std::fmt::Error> {
+        writeln!(self.printer.stdout(), "{}", Self::DRY_RUN.on_yellow())
+    }
+
     fn write_passed(&self) -> Result<(), std::fmt::Error> {
         writeln!(self.printer.stdout(), "{}", Self::PASSED.on_green())
     }
@@ -440,12 +447,14 @@ impl StatusPrinter {
 }
 
 /// Run all hooks.
+#[allow(clippy::fn_params_excessive_bools)]
 async fn run_hooks(
     workspace: &Workspace,
     hooks: &[InstalledHook],
     filenames: Vec<PathBuf>,
     store: &Store,
     show_diff_on_failure: bool,
+    dry_run: bool,
     verbose: bool,
     printer: Printer,
 ) -> Result<ExitStatus> {
@@ -495,7 +504,7 @@ async fn run_hooks(
 
         for hook in hooks {
             let (hook_success, new_diff) =
-                run_hook(hook, &filter, store, diff, verbose, &printer).await?;
+                run_hook(hook, &filter, store, diff, verbose, dry_run, &printer).await?;
 
             success &= hook_success;
             diff = new_diff;
@@ -546,6 +555,7 @@ async fn run_hook(
     store: &Store,
     diff: Vec<u8>,
     verbose: bool,
+    dry_run: bool,
     printer: &StatusPrinter,
 ) -> Result<(bool, Vec<u8>)> {
     let mut filenames = filter.for_hook(hook);
@@ -585,18 +595,35 @@ async fn run_hook(
         vec![]
     };
 
-    let (status, output) = hook
-        .language
-        .run(hook, &filenames, store)
-        .await
-        .context(format!("Failed to run hook `{hook}`"))?;
+    let (status, output) = if dry_run {
+        let mut output = Vec::new();
+        if !filenames.is_empty() {
+            writeln!(
+                output,
+                "`{}` would be run on {} files:",
+                hook,
+                filenames.len()
+            )?;
+        }
+        for filename in &filenames {
+            writeln!(output, "- {}", filename.to_string_lossy())?;
+        }
+        (0, output)
+    } else {
+        hook.language
+            .run(hook, &filenames, store)
+            .await
+            .context(format!("Failed to run hook `{hook}`"))?
+    };
 
     let duration = start.elapsed();
 
     let new_diff = git::get_diff().await?;
     let file_modified = diff != new_diff;
     let success = status == 0 && !file_modified;
-    if success {
+    if dry_run {
+        printer.write_dry_run()?;
+    } else if success {
         printer.write_passed()?;
     } else {
         printer.write_failed()?;

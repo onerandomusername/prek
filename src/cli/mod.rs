@@ -315,6 +315,7 @@ pub(crate) struct RunExtraArgs {
     pub(crate) rewrite_command: Option<String>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct RunArgs {
     /// Include the specified hooks or projects.
@@ -394,6 +395,10 @@ pub(crate) struct RunArgs {
     /// When hooks fail, run `git diff` directly afterward.
     #[arg(long)]
     pub(crate) show_diff_on_failure: bool,
+
+    /// Do not run the hooks, but print the hooks that would have been run.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
 
     #[command(flatten)]
     pub(crate) extra: RunExtraArgs,
