@@ -527,14 +527,23 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
     let context = TestContext::new();
     context.init_project();
     context.configure_git_author();
+    context.disable_auto_crlf();
 
-    context.write_pre_commit_config("repos: []");
+    context.write_pre_commit_config(indoc::indoc! {r"
+        repos:
+          - repo: meta
+            hooks:
+              - id: identity
+    "});
 
     // Subproject with built-in hooks.
     let app = context.work_dir().child("app");
     app.create_dir_all()?;
     app.child(CONFIG_FILE).write_str(indoc::indoc! {r"
         repos:
+          - repo: meta
+            hooks:
+              - id: identity
           - repo: https://github.com/pre-commit/pre-commit-hooks
             rev: v5.0.0
             hooks:
@@ -542,6 +551,7 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
               - id: check-yaml
               - id: check-json
               - id: mixed-line-ending
+              - id: trailing-whitespace
               - id: check-added-large-files
                 args: ['--maxkb', '1']
     "})?;
@@ -550,6 +560,9 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
         .write_str("No trailing newline")?;
     app.child("eof_multiple_lf.txt").write_str("Multiple\n\n")?;
     app.child("mixed.txt").write_str("line1\nline2\r\n")?;
+    app.child("trailing_ws.txt")
+        .write_str("line with trailing space \n")?;
+    app.child("correct.txt").write_str("All good here\n")?;
 
     app.child("invalid.yaml").write_str("a: b: c")?;
     app.child("duplicate.yaml").write_str("a: 1\na: 2")?;
@@ -571,16 +584,32 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
     exit_code: 1
     ----- stdout -----
     Running hooks for `app`:
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+      correct.txt
+      invalid.yaml
+      empty.json
+      duplicate.json
+      trailing_ws.txt
+      large.bin
+      eof_multiple_lf.txt
+      duplicate.yaml
+      empty.yaml
+      mixed.txt
+      invalid.json
+      .pre-commit-config.yaml
+      eof_no_newline.txt
     fix end of files.........................................................Failed
     - hook id: end-of-file-fixer
     - exit code: 1
     - files were modified by this hook
-      Fixing duplicate.json
-      Fixing duplicate.yaml
-      Fixing invalid.json
       Fixing invalid.yaml
+      Fixing duplicate.json
       Fixing eof_no_newline.txt
       Fixing eof_multiple_lf.txt
+      Fixing duplicate.yaml
+      Fixing invalid.json
     check yaml...............................................................Failed
     - hook id: check-yaml
     - exit code: 1
@@ -594,15 +623,36 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
     mixed line ending........................................................Failed
     - hook id: mixed-line-ending
     - exit code: 1
+    - files were modified by this hook
       Fixing mixed.txt
+    trim trailing whitespace.................................................Failed
+    - hook id: trailing-whitespace
+    - exit code: 1
+    - files were modified by this hook
+      Fixing trailing_ws.txt
     check for added large files..............................................Passed
+
+    Running hooks for `.`:
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+      app/.pre-commit-config.yaml
+      app/invalid.json
+      app/duplicate.yaml
+      app/correct.txt
+      app/mixed.txt
+      app/invalid.yaml
+      app/empty.yaml
+      app/duplicate.json
+      app/empty.json
+      app/large.bin
+      app/eof_no_newline.txt
+      .pre-commit-config.yaml
+      app/eof_multiple_lf.txt
+      app/trailing_ws.txt
 
     ----- stderr -----
     "#);
-
-    // Commit auto-fixes so size check won't re-trigger on re-run.
-    context.git_add(".");
-    context.git_commit("Apply auto-fixes from hooks");
 
     // Fix YAML and JSON issues, then stage.
     app.child("invalid.yaml").write_str("a:\n  b: c")?;
@@ -618,18 +668,54 @@ fn builtin_hooks_workspace_mode() -> Result<()> {
     exit_code: 1
     ----- stdout -----
     Running hooks for `app`:
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+      correct.txt
+      invalid.yaml
+      empty.json
+      duplicate.json
+      trailing_ws.txt
+      large.bin
+      eof_multiple_lf.txt
+      duplicate.yaml
+      empty.yaml
+      mixed.txt
+      invalid.json
+      .pre-commit-config.yaml
+      eof_no_newline.txt
     fix end of files.........................................................Failed
     - hook id: end-of-file-fixer
     - exit code: 1
     - files were modified by this hook
-      Fixing duplicate.yaml
-      Fixing duplicate.json
       Fixing invalid.yaml
+      Fixing duplicate.json
+      Fixing duplicate.yaml
       Fixing invalid.json
     check yaml...............................................................Passed
     check json...............................................................Passed
     mixed line ending........................................................Passed
+    trim trailing whitespace.................................................Passed
     check for added large files..............................................Passed
+
+    Running hooks for `.`:
+    identity.................................................................Passed
+    - hook id: identity
+    - duration: [TIME]
+      app/.pre-commit-config.yaml
+      app/invalid.json
+      app/duplicate.yaml
+      app/correct.txt
+      app/mixed.txt
+      app/invalid.yaml
+      app/empty.yaml
+      app/duplicate.json
+      app/empty.json
+      app/large.bin
+      app/eof_no_newline.txt
+      .pre-commit-config.yaml
+      app/eof_multiple_lf.txt
+      app/trailing_ws.txt
 
     ----- stderr -----
     ");
