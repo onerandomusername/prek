@@ -27,7 +27,7 @@ use crate::{config, git};
 #[derive(Default, Clone)]
 struct Revision {
     rev: String,
-    sha1: String,
+    frozen: Option<String>,
 }
 
 pub(crate) async fn auto_update(
@@ -96,7 +96,7 @@ pub(crate) async fn auto_update(
     .map(async |(remote_repo, _)| {
         let progress = reporter.on_update_start(&remote_repo.to_string());
 
-        let result = update_repo(remote_repo, bleeding_edge).await;
+        let result = update_repo(remote_repo, bleeding_edge, freeze).await;
 
         reporter.on_update_complete(progress);
 
@@ -131,11 +131,7 @@ pub(crate) async fn auto_update(
                         "[{}] updating {} -> {}",
                         remote_repo.repo.as_str().cyan(),
                         remote_repo.rev,
-                        if freeze {
-                            new_rev.sha1.as_str()
-                        } else {
-                            new_rev.rev.as_str()
-                        }
+                        new_rev.rev
                     )?;
                 }
 
@@ -169,7 +165,7 @@ pub(crate) async fn auto_update(
     for (project, revisions) in project_updates {
         let has_changes = revisions.iter().any(Option::is_some);
         if has_changes {
-            write_new_config(project.config_file(), &revisions, freeze).await?;
+            write_new_config(project.config_file(), &revisions).await?;
         }
     }
 
@@ -179,7 +175,7 @@ pub(crate) async fn auto_update(
     Ok(ExitStatus::Success)
 }
 
-async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool) -> Result<Revision> {
+async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool, freeze: bool) -> Result<Revision> {
     let tmp_dir = tempfile::tempdir()?;
 
     trace!(
@@ -225,18 +221,13 @@ async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool) -> Result<Revision>
     };
 
     let output = cmd.output().await?;
-    let (mut rev, sha1) = if output.status.success() {
+    let mut rev = if output.status.success() {
         let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let sha1 = git::git_cmd("git rev-list")?
-            .arg("rev-list")
-            .arg("-1")
-            .arg(&rev)
-            .current_dir(tmp_dir.path())
-            .output()
-            .await?
-            .stdout;
-        let sha1 = String::from_utf8_lossy(&sha1).trim().to_string();
-        (rev, sha1)
+        let rev = get_best_candidate_tag(tmp_dir.path(), &rev, &repo.rev)
+            .await
+            .unwrap_or(rev);
+        trace!("Using best candidate tag `{rev}`");
+        rev
     } else {
         trace!("Failed to describe FETCH_HEAD, using rev-parse instead");
         // "fatal: no tag exactly matches xxx"
@@ -248,16 +239,25 @@ async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool) -> Result<Revision>
             .output()
             .await?
             .stdout;
-        let sha1 = String::from_utf8_lossy(&stdout).trim().to_string();
-        (sha1.clone(), sha1)
+        String::from_utf8_lossy(&stdout).trim().to_string()
     };
-    trace!("Resolved latest tag to `{rev}` (`{sha1}`)");
+    trace!("Resolved latest tag to `{rev}`");
 
-    if !bleeding_edge {
-        rev = get_best_candidate_tag(tmp_dir.path(), &rev, &sha1, &repo.rev)
-            .await
-            .unwrap_or(rev);
-        trace!("Using best candidate tag `{rev}` for `{sha1}`");
+    let mut frozen = None;
+    if freeze {
+        let exact = git::git_cmd("git rev-parse")?
+            .arg("rev-parse")
+            .arg(&rev)
+            .current_dir(tmp_dir.path())
+            .output()
+            .await?
+            .stdout;
+        let exact = String::from_utf8_lossy(&exact).trim().to_string();
+        if rev != exact {
+            trace!("Freezing revision to `{exact}`");
+            frozen = Some(rev);
+            rev = exact;
+        }
     }
 
     // Workaround for Windows: https://github.com/pre-commit/pre-commit/issues/2865,
@@ -307,7 +307,7 @@ async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool) -> Result<Revision>
         ));
     }
 
-    let new_revision = Revision { rev, sha1 };
+    let new_revision = Revision { rev, frozen };
 
     Ok(new_revision)
 }
@@ -315,16 +315,11 @@ async fn update_repo(repo: &RemoteRepo, bleeding_edge: bool) -> Result<Revision>
 /// Multiple tags can exist on an SHA. Sometimes a moving tag is attached
 /// to a version tag. Try to pick the tag that looks like a version and most similar
 /// to the current revision.
-async fn get_best_candidate_tag(
-    repo: &Path,
-    rev: &str,
-    sha1: &str,
-    current_rev: &str,
-) -> Result<String> {
+async fn get_best_candidate_tag(repo: &Path, rev: &str, current_rev: &str) -> Result<String> {
     let stdout = git::git_cmd("git tag")?
         .arg("tag")
         .arg("--points-at")
-        .arg(sha1)
+        .arg(format!("{rev}^{{}}"))
         .check(true)
         .current_dir(repo)
         .output()
@@ -343,7 +338,7 @@ async fn get_best_candidate_tag(
         .ok_or_else(|| anyhow::anyhow!("No tags found for revision {}", rev))
 }
 
-async fn write_new_config(path: &Path, revisions: &[Option<Revision>], freeze: bool) -> Result<()> {
+async fn write_new_config(path: &Path, revisions: &[Option<Revision>]) -> Result<()> {
     let mut lines = fs_err::tokio::read_to_string(path)
         .await?
         .split_inclusive('\n')
@@ -382,14 +377,9 @@ async fn write_new_config(path: &Path, revisions: &[Option<Revision>], freeze: b
 
         let mut new_rev = Vec::new();
         let mut serializer = serde_yaml::Serializer::new(&mut new_rev);
-        serializer.serialize_map(Some(1))?.serialize_entry(
-            "rev",
-            if freeze {
-                &revision.sha1
-            } else {
-                &revision.rev
-            },
-        )?;
+        serializer
+            .serialize_map(Some(1))?
+            .serialize_entry("rev", &revision.rev)?;
         serializer.end()?;
 
         let (_, new_rev) = new_rev
@@ -410,8 +400,8 @@ async fn write_new_config(path: &Path, revisions: &[Option<Revision>], freeze: b
             new_rev.trim().to_string()
         };
 
-        let comment = if freeze {
-            format!("  # frozen: {}", &revision.rev)
+        let comment = if let Some(frozen) = &revision.frozen {
+            format!("  # frozen: {frozen}")
         } else if caps[5].trim().starts_with("# frozen:") {
             String::new()
         } else {
