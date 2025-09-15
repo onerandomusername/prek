@@ -5,9 +5,8 @@ use std::str::Utf8Error;
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use itertools::Itertools;
 use rustc_hash::FxHashSet;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::process;
@@ -426,44 +425,65 @@ pub(crate) async fn has_hooks_path_set() -> Result<bool> {
     }
 }
 
-pub(crate) async fn get_lfs_files(paths: &[&Path]) -> Result<Vec<String>, Error> {
-    let mut job = git_cmd("git check-attr")?
+pub(crate) async fn get_lfs_files(paths: &[&Path]) -> Result<FxHashSet<PathBuf>, Error> {
+    if paths.is_empty() {
+        return Ok(FxHashSet::default());
+    }
+
+    let mut child = git_cmd("git check-attr")?
         .arg("check-attr")
         .arg("filter")
         .arg("-z")
         .arg("--stdin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .check(true)
         .spawn()?;
 
-    {
-        let mut stdin = job.stdin.take().expect("Failed to open stdin");
-        stdin
-            .write_all(
-                paths
-                    .iter()
-                    .map(|f| f.to_string_lossy())
-                    .join("\0")
-                    .as_ref(),
-            )
-            .await?;
+    let mut stdout = child.stdout.take().expect("failed to open stdout");
+    let mut stdin = child.stdin.take().expect("failed to open stdin");
+
+    let writer = async move {
+        for path in paths {
+            stdin.write_all(path.to_string_lossy().as_bytes()).await?;
+            stdin.write_all(b"\0").await?;
+        }
+        stdin.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    };
+    let reader = async move {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).await?;
+        Ok::<_, std::io::Error>(out)
+    };
+
+    let (read_result, _write_result) = tokio::try_join!(biased; reader, writer)?;
+
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(Error::Command(process::Error::Status {
+            summary: "git check-attr".to_string(),
+            error: StatusError {
+                status,
+                output: None,
+            },
+        }));
     }
 
-    Ok(
-        String::from_utf8_lossy(&job.wait_with_output().await?.stdout)
-            .trim()
-            .split('\0')
-            .tuples::<(_, _, _)>()
-            .filter_map(|(file, _, attr)| {
-                if attr == "lfs" {
-                    Some(file.to_owned())
-                } else {
-                    None
-                }
-            })
-            .collect(),
-    )
+    let mut lfs_files = FxHashSet::default();
+    let read_result = String::from_utf8_lossy(&read_result);
+    let mut it = read_result.split_terminator('\0');
+    loop {
+        let (Some(file), Some(_attr), Some(value)) = (it.next(), it.next(), it.next()) else {
+            break;
+        };
+        if value == "lfs" {
+            lfs_files.insert(PathBuf::from(file));
+        }
+    }
+
+    Ok(lfs_files)
 }
 
 /// Check if a git revision exists
